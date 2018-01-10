@@ -1,0 +1,257 @@
+package com.anthem.gbd.pi.dao
+/*
+ * Copyright (c) 2017, Anthem Inc. All rights reserved.
+ * DO NOT ALTER OR REMOVE THIS FILE HEADER.
+ *
+ */
+
+import org.apache.commons.codec.digest.DigestUtils
+
+import scala.collection.JavaConverters._
+
+import org.apache.spark.sql.Row
+import org.apache.spark.rdd.PairRDDFunctions
+
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.util.Bytes
+
+import com.anthem.etl.util.Utils
+import com.anthem.etl.config.DataSourceConfig
+import com.anthem.etl.dao.GenericDAO
+import com.anthem.etl.dao.JSONHolder
+import com.anthem.etl.dao.ETLStrategy
+import com.anthem.etl.dao.ImportTrait
+
+import scala.collection.JavaConverters._
+
+import org.apache.avro.LogicalTypes.Decimal
+import org.apache.spark.rdd.PairRDDFunctions
+import org.apache.spark.sql.Row
+import java.sql.Timestamp
+import scala.collection.Map
+
+import org.apache.spark.sql.functions._
+/*import scala.math.String*/
+
+/**
+ * @author Yasin/Sreecharan
+ * @version 1.0
+ *
+ * Imports Finalized Claims and the ClaimLine information into HBase.
+ * Illustrates how to persist a 1-N entity in HBase
+ *
+ */
+
+class MemberDAO_sree4 extends ETLStrategy with ImportTrait with Serializable {
+
+  override def importData(dataSrcCfg: DataSourceConfig) {
+    val sparkContext = getSparkContext
+    val sqlContext = getSQLContext
+    import sqlContext.implicits._
+
+    //val memDF = getHiveContext.sql("SELECT cmmd.meme_ck as meme_ck_mem, mem.meme_fam_link_id,mem.meme_hist_link_id,mem.meme_medcd_no,mem.meme_birth_dt,cgg.grgr_mctr_vip,cgg.grgr_name,cgg.grgr_ck as grgr_ck_mem,cgg.GRGR_ID,cmnd.GRGR_ID as GRGR_ID_CMND, cmmd.MEMD_EVENT_CD,cmmd.MEMD_HCFA_TERM_DT,cmmd.MEMD_HCFA_EFF_DT,memcob.mecb_insur_type,memcob.mecb_insur_order,memcob.mecb_eff_dt FROM pinnga1ph_dv_r1a_wh_gbd.CMC_GRGR_GROUP as cgg,pinnga1ph_dv_r1a_wh_gbd.cmc_memd_mecr_detl as cmmd,pinnga1ph_dv_r1a_wh_gbd.cmc_mecb_cob as memcob,pinnga1ph_dv_r1a_wh_gbd.CMC_MEME_MEMBER as mem  WHERE cgg.grgr_ck=cmmd.grgr_ck and cmmd.meme_ck=memcob.meme_ck and cmmd.meme_ck=mem.meme_ck")
+    //val memDF = getHiveContext.sql("select cmmd.meme_ck as meme_ck_mem ,mem.meme_fam_link_id,mem.meme_hist_link_id,mem.meme_medcd_no, mem.meme_birth_dt, cgg.grgr_mctr_vip, cgg.grgr_name, cgg.grgr_ck as grgr_ck_mem,cgg.GRGR_ID from cmc_memd_mecr_detl as cmmd, CMC_GRGR_GROUP as cgg, CMC_MEME_MEMBER as mem where cgg.grgr_ck=cmmd.grgr_ck and cmmd.meme_ck=mem.meme_ck")
+
+    //val memDF = getHiveContext.sql("select meme_ck as meme_ck_mem, meme_fam_link_id, meme_medcd_no from  pinnga1ph_dv_r1a_wh_gbd.CMC_MEME_MEMBER where meme_ck= 147452050") //25604701
+    val memDF = getHiveContext.sql("select meme_ck as meme_ck_mem, meme_fam_link_id, meme_medcd_no from  pinnga1ph_dv_r1a_wh_gbd.CMC_MEME_MEMBER where meme_ck= 147452050")
+
+    val dataSetCfg = dataSrcCfg.datasets.get(0)
+
+    val clmDf = getHiveContext.sql("SELECT clcl_id, meme_ck, grgr_ck, sbsb_ck, sgsg_ck from pinnga1ph_dv_r1a_wh_gbd.cmc_clcl_claim where meme_ck= 147452050")
+
+    val clmLnDf = getHiveContext.sql("SELECT cdml_seq_no, meme_ck as meme_ck_ln , sepc_price_id, ipcd_id from pinnga1ph_dv_r1a_wh_gbd.cmc_cdml_cl_line where meme_ck= 147452050")
+
+    val mecbCobDf = getHiveContext.sql("select meme_ck as meme_ck_cob , mecb_insur_type,mecb_insur_order, mecb_eff_dt from pinnga1ph_dv_r1a_wh_gbd.cmc_mecb_cob where meme_ck= 147452050")
+
+    val eventsDf = getHiveContext.sql("select meme_ck as meme_ck_evt ,memd_event_cd, memd_hcfa_term_dt, memd_hcfa_eff_dt from pinnga1ph_dv_r1a_wh_gbd.cmc_memd_mecr_detl where meme_ck= 147452050")
+
+    val combineClmDF = clmDf.as("claim").join(clmLnDf.as("claimLn"), ($"claim.meme_ck" === $"claimLn.meme_ck_ln"), "inner")
+
+    val clmDataSet = combineClmDF.as[ClaimRecord]
+
+    val groupedClaimSet = clmDataSet.groupBy($"clcl_id", $"meme_ck", $"grgr_ck", $"sbsb_ck", $"sgsg_ck")
+
+    val groupedClaimSet1 = groupedClaimSet.mapGroups((l, iter) => {
+
+      var claimLineSet = Set[ClaimLine]()
+
+      val claimLineAll1 = iter.map(line => new ClaimLineInfo(
+        new ClaimLine(line.cdml_seq_no, line.meme_ck_ln, line.sepc_price_id,
+          line.ipcd_id))).toArray
+
+      for (z <- claimLineAll1) {
+        claimLineSet += z.a
+      }
+
+      val claims = new Claim(l.getString(0), l.getDecimal(1), l.getDecimal(2), l.getDecimal(3), l.getDecimal(4), claimLineSet.toArray)
+
+      (l.getDecimal(1), claims) // getString(0) i.e. clcl_id is the column for the rowkey 
+    })
+
+    val grClmDF = groupedClaimSet1.toDF().withColumnRenamed("_1", "meme_ck").withColumnRenamed("_2", "clm_rec")
+
+  println("grClmDF schema"+  grClmDF.printSchema)
+
+    //Group the member Data
+    val memDataSet = memDF.as[MemberRecord]
+
+    val groupedMemDataSet = memDataSet.groupBy($"meme_ck_mem", $"meme_fam_link_id", $"meme_medcd_no")
+
+    val groupedMemDataSet1 = groupedMemDataSet.mapGroups((k, iter) => {
+
+      val memClm = new MemberRecord(k.getDecimal(0), k.getString(1), k.getString(2))
+
+      (k.getDecimal(0), memClm)
+    })
+
+    val grMemDF = groupedMemDataSet1.toDF().withColumnRenamed("_1", "meme_ck_m").withColumnRenamed("_2", "meme_rec")
+
+   println("grMemDF schema"+ grMemDF.printSchema)
+
+    //grMemDF.show()
+
+    //Group the Mem Cob data
+    val memCobDataSet = mecbCobDf.as[MemberCob]
+
+    val groupedMemCobDataSet = memCobDataSet.groupBy($"meme_ck_cob", $"mecb_insur_type", $"mecb_insur_order", $"mecb_eff_dt")
+
+    val groupedMemCobDataSet1 = groupedMemCobDataSet.mapGroups((k, iter) => {
+
+      val memCob = new MemberCob(k.getDecimal(0), k.getString(1), k.getString(2), k.getTimestamp(3))
+
+      (k.getDecimal(0), memCob)
+    })
+    val grMemCobDF = groupedMemCobDataSet1.toDF().withColumnRenamed("_1", "meme_ck_cob").withColumnRenamed("_2", "meme_cob_rec")
+
+    //Group the Events data
+    val eventsDataSet = eventsDf.as[Events]
+
+    val groupedEventsDataSet = eventsDataSet.groupBy($"meme_ck_evt", $"memd_event_cd", $"memd_hcfa_eff_dt", $"memd_hcfa_term_dt")
+
+    val groupedEventsDataSet1 = groupedEventsDataSet.mapGroups((k, iter) => {
+
+      val event = new Events(k.getDecimal(0), k.getString(1), k.getTimestamp(2), k.getTimestamp(3))
+
+      (k.getDecimal(0), event)
+    })
+    val grEventDF = groupedEventsDataSet1.toDF().withColumnRenamed("_1", "meme_ck_events").withColumnRenamed("_2", "event_rec")
+
+    //group the claim and claim line data
+    val combineMemClmDF = grMemDF.join(grClmDF, ($"meme_ck_m" === $"meme_ck"), "inner")
+      .join(grMemCobDF, ($"meme_ck_m" === $"meme_ck_cob"), "left")
+      .join(grEventDF, ($"meme_ck_m" === $"meme_ck_events"), "left")
+
+    println("combineMemClmDF schema"+ combineMemClmDF.printSchema)
+    //combineMemClmDF.show()
+
+    val combineMemClmDs = combineMemClmDF.as[MemberRecord2]
+
+    val grpComb = combineMemClmDs.groupBy($"meme_rec.meme_ck_mem", $"meme_rec.meme_fam_link_id", $"meme_rec.meme_medcd_no")
+
+    val grpComb1 = grpComb.mapGroups((l, iter) => {
+
+      var claimSet = Set[Claim2]()
+      var memCobSet = Set[MemberCob2]()
+      var eventsSet = Set[Events2]()
+
+      val member = iter.map(line => new MemberClaimInfo(
+        if (line.meme_cob_rec == null) new MemberCob2(null, null, null, null)
+        else new MemberCob2(line.meme_cob_rec.meme_ck_cob, line.meme_cob_rec.mecb_insur_type, line.meme_cob_rec.mecb_insur_order, line.meme_cob_rec.mecb_eff_dt),
+
+        if (line.event_rec == null) new Events2(null, null, null, null)
+        else new Events2(line.event_rec.meme_ck_evt, line.event_rec.memd_event_cd, line.event_rec.memd_hcfa_eff_dt, line.event_rec.memd_hcfa_term_dt),
+
+        if (line.clm_rec == null) new Claim2(null, null, null, null, null, null)
+        else new Claim2(line.clm_rec.clcl_id, line.clm_rec.meme_ck, line.clm_rec.grgr_ck, line.clm_rec.sbsb_ck, line.clm_rec.sgsg_ck, line.clm_rec.cdmlall))).toArray
+
+      for (z <- member) {
+        if (z.a.meme_ck_cob != null) memCobSet += z.a
+        if (z.b.meme_ck_evt != null) eventsSet += z.b
+        if (z.c.meme_ck != null) claimSet += z.c
+      }
+
+      val memClaim = new MemClaim(l.getDecimal(0), l.getString(1), l.getString(2), memCobSet.toArray, eventsSet.toArray, claimSet.toArray)
+
+      //val memClaim = new MemClaim(l.getDecimal(0), l.getString(1), l.getString(2), (if (memCobSet.isEmpty)  Array[MemberCob2]() else  memCobSet.toArray), 
+      //   ( if (eventsSet.isEmpty) Array[Events2]() else eventsSet.toArray), (if (claimSet.isEmpty) Array[Claim2]() else claimSet.toArray) )
+
+      (l.getDecimal(0), memClaim) // getString(0) i.e. clcl_id is the column for the rowkey 
+    })
+
+    //This is the structure of the MemClaim
+    //grpComb1: org.apache.spark.sql.Dataset[(java.math.BigDecimal, MemClaim)] = [_1: decimal(38,18), _2: struct<meme_ck_mem:decimal(38,18),meme_fam_link_id:string,meme_medcd_no:string,claimsall:array<struct<clcl_id:string,meme_ck:decimal(38,18),grgr_ck:decimal(38,18),sbsb_ck:decimal(38,18),sgsg_ck:decimal(38,18),cdmlall:array<struct<cdml_seq_no:decimal(38,18),meme_ck_ln:decimal(38,18),sepc_price_id:string,ipcd_id:string>>>>>]
+
+    grpComb1.collect().foreach(println)
+    
+    println("grpComb1 schema"+ grpComb1.schema)
+     println("grpComb1 show"+grpComb1.show())
+
+    val columnFamily = dataSetCfg.hbase_table_columnfamily
+    val columnName = dataSetCfg.hbase_table_columnname
+    val putRDD = grpComb1.rdd.map({
+      case (key, value) => {
+        val digest = DigestUtils.md5Hex(String.valueOf(key))
+        val rowKey = new StringBuilder(digest.substring(0, 8)).append(key).toString()
+        val holder = new JSONHolder(Utils.asJSONString(value))
+        println("holder" + holder)
+        val p = new Put(Bytes.toBytes(rowKey))
+        p.addColumn(Bytes.toBytes(columnFamily), Bytes.toBytes(columnName), Utils.serialize(holder))
+
+        (new org.apache.hadoop.hbase.io.ImmutableBytesWritable, p)
+      }
+    })
+
+    val hbaseTable = dataSetCfg.hbase_schema.concat(":").concat(dataSetCfg.hbase_table_name)
+    new PairRDDFunctions(putRDD).saveAsNewAPIHadoopDataset(getMapReduceJobConfiguration(hbaseTable))
+  }
+
+}
+
+case class ClaimLine(cdml_seq_no: BigDecimal, meme_ck_ln: BigDecimal, sepc_price_id: String, ipcd_id: String)
+
+case class MemberClaimRecord(meme_ck_mem: BigDecimal, meme_fam_link_id: String, meme_medcd_no: String,
+  clcl_id: String, meme_ck: BigDecimal, grgr_ck: BigDecimal, sbsb_ck: BigDecimal,
+  sgsg_ck: BigDecimal,
+  cdml_seq_no: BigDecimal, meme_ck_ln: BigDecimal,
+  sepc_price_id: String, ipcd_id: String)
+
+case class ClaimRecord(clcl_id: String, meme_ck: BigDecimal, grgr_ck: BigDecimal, sbsb_ck: BigDecimal,
+  sgsg_ck: BigDecimal,
+  cdml_seq_no: BigDecimal, meme_ck_ln: BigDecimal,
+  sepc_price_id: String, ipcd_id: String)
+
+case class MemberRecord(meme_ck_mem: BigDecimal, meme_fam_link_id: String, meme_medcd_no: String)
+
+case class MemberCob(meme_ck_cob: BigDecimal, mecb_insur_type: String, mecb_insur_order: String, mecb_eff_dt: Timestamp)
+
+case class Events(meme_ck_evt: BigDecimal, memd_event_cd: String, memd_hcfa_eff_dt: Timestamp, memd_hcfa_term_dt: Timestamp)
+
+case class MemberCob2(meme_ck_cob: BigDecimal, mecb_insur_type: String, mecb_insur_order: String, mecb_eff_dt: Timestamp)
+
+case class Events2(meme_ck_evt: BigDecimal, memd_event_cd: String, memd_hcfa_eff_dt: Timestamp, memd_hcfa_term_dt: Timestamp)
+
+case class ClaimInterim(
+  clcl_id: String, meme_ck: BigDecimal, grgr_ck: String, sbsb_ck: String, sgsg_ck: String,
+  cdml_seq_no: BigDecimal, meme_ck_ln: BigDecimal, sepc_price_id: String, ipcd_id: String)
+
+case class Claim(
+  clcl_id: String, meme_ck: BigDecimal, grgr_ck: BigDecimal, sbsb_ck: BigDecimal, sgsg_ck: BigDecimal, cdmlall: Array[ClaimLine])
+
+case class Claim2(
+  clcl_id: String, meme_ck: BigDecimal, grgr_ck: BigDecimal, sbsb_ck: BigDecimal, sgsg_ck: BigDecimal, cdmlall: Array[ClaimLine])
+
+case class Claiminfo(a: ClaimInterim)
+
+case class ClaimLineInfo(a: ClaimLine)
+
+case class MemberInfo(a: MemberRecord)
+
+case class MemberClaimInfo(a: MemberCob2, b: Events2, c: Claim2)
+
+case class MemClaim(
+  meme_ck_mem: BigDecimal, meme_fam_link_id: String, meme_medcd_no: String, cobAll: Array[MemberCob2], eventsAll: Array[Events2], claimsall: Array[Claim2])
+
+case class MemberRecord2(meme_ck_m: BigDecimal, meme_rec: MemberRecord, meme_ck: BigDecimal, clm_rec: Claim, meme_cob_rec: MemberCob, event_rec: Events)
+
+
+
